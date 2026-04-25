@@ -42,16 +42,65 @@ const HEADER_MAP = {
   ],
 };
 
-// Mock supplier dataset — in production these would come from real APIs
+// Suppliers searched by the live price-lookup feature.
+// Fastenal is listed first as the user's preferred negotiated-pricing supplier.
+// `search(q)` builds the correct search URL per supplier so the manual fallback
+// link actually works (Grainger uses ?searchQuery=, others differ).
 const SUPPLIERS = [
-  { name: "Grainger", domain: "grainger.com", deliveryDays: 2, rating: 4.7 },
-  { name: "MSC Industrial", domain: "mscdirect.com", deliveryDays: 3, rating: 4.6 },
-  { name: "Motion Industries", domain: "motionindustries.com", deliveryDays: 4, rating: 4.5 },
-  { name: "Amazon Business", domain: "amazon.com", deliveryDays: 1, rating: 4.4 },
-  { name: "Fastenal", domain: "fastenal.com", deliveryDays: 3, rating: 4.5 },
-  { name: "Zoro", domain: "zoro.com", deliveryDays: 2, rating: 4.3 },
-  { name: "Uline", domain: "uline.com", deliveryDays: 1, rating: 4.6 },
+  {
+    name: "Fastenal",
+    domain: "fastenal.com",
+    deliveryDays: 3,
+    rating: 4.5,
+    preferred: true,
+    search: (q) => `https://www.fastenal.com/products?term=${encodeURIComponent(q)}`,
+  },
+  {
+    name: "Grainger",
+    domain: "grainger.com",
+    deliveryDays: 2,
+    rating: 4.7,
+    search: (q) => `https://www.grainger.com/search?searchQuery=${encodeURIComponent(q)}`,
+  },
+  {
+    name: "MSC Industrial",
+    domain: "mscdirect.com",
+    deliveryDays: 3,
+    rating: 4.6,
+    search: (q) => `https://www.mscdirect.com/browse/tn?searchterm=${encodeURIComponent(q)}`,
+  },
+  {
+    name: "Motion Industries",
+    domain: "motionindustries.com",
+    deliveryDays: 4,
+    rating: 4.5,
+    search: (q) => `https://www.motionindustries.com/search?searchTerm=${encodeURIComponent(q)}`,
+  },
+  {
+    name: "Zoro",
+    domain: "zoro.com",
+    deliveryDays: 2,
+    rating: 4.3,
+    search: (q) => `https://www.zoro.com/search?q=${encodeURIComponent(q)}`,
+  },
+  {
+    name: "Uline",
+    domain: "uline.com",
+    deliveryDays: 1,
+    rating: 4.6,
+    search: (q) => `https://www.uline.com/Browse_Search.aspx?keywords=${encodeURIComponent(q)}`,
+  },
+  {
+    name: "Amazon Business",
+    domain: "amazon.com",
+    deliveryDays: 1,
+    rating: 4.4,
+    search: (q) => `https://www.amazon.com/s?k=${encodeURIComponent(q)}`,
+  },
 ];
+
+// How many items to look up in parallel. Web search is rate-limited so keep this modest.
+const LOOKUP_CONCURRENCY = 3;
 
 // ---------- Helpers ----------
 const fmt = (n) =>
@@ -114,29 +163,67 @@ function parseSheetData(rows) {
   return items;
 }
 
-// Generate deterministic but realistic-looking comparison prices
-function generateComparison(item) {
-  const seed = (item.id + item.description).split("").reduce((a, c) => a + c.charCodeAt(0), 0);
-  const rng = (n) => ((Math.sin(seed + n) + 1) / 2);
+// Call the serverless /api/ai endpoint with action=priceLookup.
+// Returns an array of offers (some may have found:false) sourced from real
+// supplier websites via the Anthropic web_search tool.
+async function lookupItemPrices(item, password) {
+  const res = await fetch("/api/ai", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      password,
+      action: "priceLookup",
+      item: {
+        description: item.description,
+        partNumber: item.partNumber,
+        quantity: item.quantity,
+      },
+      suppliers: SUPPLIERS.map((s) => ({ name: s.name, domain: s.domain })),
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Lookup failed (${res.status})`);
+  }
+  const data = await res.json();
+  return data.offers || [];
+}
 
-  const offers = SUPPLIERS.map((s, i) => {
-    // Discount factor between -25% (cheaper) and +10% (more expensive)
-    const factor = 0.75 + rng(i) * 0.35;
-    const unitPrice = +(item.unitPrice * factor).toFixed(2);
+// Take the raw offers from the API and add UI-side fields (delivery, rating,
+// computed total, manual-search fallback URL) and sort: real matches by
+// ascending price first, no-match suppliers last.
+function enrichOffers(rawOffers, item) {
+  const supMap = Object.fromEntries(SUPPLIERS.map((s) => [s.name, s]));
+  const query = item.partNumber || item.description;
+  const enriched = (rawOffers || []).map((o) => {
+    const sup = supMap[o.supplier] || {};
+    const fallbackUrl = sup.search ? sup.search(query) : null;
+    if (o.found) {
+      return {
+        ...o,
+        unitPrice: Number(o.unitPrice) || 0,
+        total: +((Number(o.unitPrice) || 0) * item.quantity).toFixed(2),
+        deliveryDays: sup.deliveryDays,
+        rating: sup.rating,
+        preferred: !!sup.preferred,
+        fallbackUrl,
+      };
+    }
     return {
-      supplier: s.name,
-      domain: s.domain,
-      unitPrice,
-      total: +(unitPrice * item.quantity).toFixed(2),
-      deliveryDays: s.deliveryDays,
-      rating: s.rating,
-      searchUrl: `https://www.${s.domain}/search?q=${encodeURIComponent(
-        item.partNumber || item.description
-      )}`,
+      ...o,
+      deliveryDays: sup.deliveryDays,
+      rating: sup.rating,
+      preferred: !!sup.preferred,
+      fallbackUrl,
     };
-  }).sort((a, b) => a.unitPrice - b.unitPrice);
-
-  return offers;
+  });
+  enriched.sort((a, b) => {
+    if (a.found && !b.found) return -1;
+    if (!a.found && b.found) return 1;
+    if (a.found && b.found) return a.unitPrice - b.unitPrice;
+    return 0;
+  });
+  return enriched;
 }
 
 // ---------- App ----------
@@ -162,13 +249,28 @@ function MROApp({ password }) {
     if (!results) return null;
     let currentSpend = 0;
     let bestSpend = 0;
+    let coveredItems = 0;
+    let pendingItems = 0;
+    let unmatchedItems = 0;
     for (const r of results) {
       currentSpend += r.item.unitPrice * r.item.quantity;
-      bestSpend += r.offers[0].total;
+      if (r.status === "loading") {
+        pendingItems++;
+        bestSpend += r.item.unitPrice * r.item.quantity; // assume parity until done
+        continue;
+      }
+      const bestFound = (r.offers || []).find((o) => o.found);
+      if (bestFound) {
+        bestSpend += bestFound.total;
+        coveredItems++;
+      } else {
+        bestSpend += r.item.unitPrice * r.item.quantity; // no match → keep current
+        unmatchedItems++;
+      }
     }
     const savings = currentSpend - bestSpend;
     const rate = currentSpend > 0 ? (savings / currentSpend) * 100 : 0;
-    return { currentSpend, bestSpend, savings, rate };
+    return { currentSpend, bestSpend, savings, rate, coveredItems, pendingItems, unmatchedItems };
   }, [results]);
 
   const selectedCount = Object.values(selected).filter(Boolean).length;
@@ -215,21 +317,64 @@ function MROApp({ password }) {
     setTab("items");
   };
 
-  // ---------- Search ----------
-  const runSearch = () => {
+  // ---------- Search (real web-search lookup) ----------
+  const runSearch = async () => {
     const chosen = items.filter((it) => selected[it.id]);
     if (chosen.length === 0) return;
-    const out = chosen.map((item) => ({
+
+    // Seed results with loading status so the UI renders progress immediately
+    const initial = chosen.map((item) => ({
       item,
-      offers: generateComparison(item),
+      offers: [],
+      status: "loading",
+      error: null,
     }));
-    setResults(out);
+    setResults(initial);
     setTab("results");
     setInsight("");
     setShowExport(false);
     setShowReport(false);
     setRfq("");
-    if (apiKey) generateInsight(out);
+
+    // Process items with bounded concurrency
+    const queue = chosen.map((item, idx) => ({ item, idx }));
+    const updateRow = (idx, patch) => {
+      setResults((cur) => {
+        if (!cur) return cur;
+        const next = [...cur];
+        next[idx] = { ...next[idx], ...patch };
+        return next;
+      });
+    };
+
+    const worker = async () => {
+      while (queue.length > 0) {
+        const job = queue.shift();
+        if (!job) break;
+        try {
+          const raw = await lookupItemPrices(job.item, password);
+          const offers = enrichOffers(raw, job.item);
+          updateRow(job.idx, { offers, status: "ready", error: null });
+        } catch (err) {
+          updateRow(job.idx, {
+            offers: [],
+            status: "error",
+            error: err.message || "Lookup failed",
+          });
+        }
+      }
+    };
+
+    const workers = Array.from({ length: LOOKUP_CONCURRENCY }, worker);
+    await Promise.all(workers);
+
+    // After all lookups finish, generate the AI insight summary
+    if (apiKey) {
+      setResults((cur) => {
+        if (cur) generateInsight(cur);
+        return cur;
+      });
+    }
   };
 
   // ---------- AI insight ----------
@@ -237,14 +382,18 @@ function MROApp({ password }) {
     if (!apiKey) return;
     setInsightLoading(true);
     try {
-      const summary = data.slice(0, 30).map((r) => ({
-        description: r.item.description,
-        partNumber: r.item.partNumber,
-        quantity: r.item.quantity,
-        currentUnitPrice: r.item.unitPrice,
-        bestSupplier: r.offers[0].supplier,
-        bestUnitPrice: r.offers[0].unitPrice,
-      }));
+      const summary = data.slice(0, 30).map((r) => {
+        const best = (r.offers || []).find((o) => o.found);
+        return {
+          description: r.item.description,
+          partNumber: r.item.partNumber,
+          quantity: r.item.quantity,
+          currentUnitPrice: r.item.unitPrice,
+          bestSupplier: best ? best.supplier : "no match found",
+          bestUnitPrice: best ? best.unitPrice : null,
+          matchConfidence: best ? best.confidence : null,
+        };
+      });
       const res = await fetch("/api/ai", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -268,13 +417,20 @@ function MROApp({ password }) {
   const generateRFQ = async () => {
     if (!results) return;
     setRfqLoading(true);
-    const top = [...results]
-      .sort(
-        (a, b) =>
-          (b.item.unitPrice - b.offers[0].unitPrice) * b.item.quantity -
-          (a.item.unitPrice - a.offers[0].unitPrice) * a.item.quantity
-      )
-      .slice(0, 20);
+
+    // Pick rows that have a real match, sorted by total savings opportunity desc.
+    // Rows with no match still get included so the supplier is asked to quote them
+    // (just no target price).
+    const rowsWithBest = results.map((r) => ({
+      r,
+      best: (r.offers || []).find((o) => o.found),
+    }));
+    const ranked = rowsWithBest.sort((a, b) => {
+      const sa = a.best ? (a.r.item.unitPrice - a.best.unitPrice) * a.r.item.quantity : 0;
+      const sb = b.best ? (b.r.item.unitPrice - b.best.unitPrice) * b.r.item.quantity : 0;
+      return sb - sa;
+    });
+    const top = ranked.slice(0, 20);
 
     if (apiKey) {
       try {
@@ -283,13 +439,14 @@ function MROApp({ password }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             password,
-            maxTokens: 1200,
-            prompt: `Write a professional RFQ email to industrial suppliers asking for quotes on these MRO items. Include subject line, greeting, item table (description, part number, qty, target price), 2-week response deadline, and contact placeholders [Your Name], [Company], [Email], [Phone]. Items:\n${JSON.stringify(
-              top.map((r) => ({
+            maxTokens: 1500,
+            prompt: `Write a professional RFQ email to an industrial supplier asking for quotes on these MRO items. Include subject line, greeting, item table (description, part number, qty, target price if available), 2-week response deadline, and contact placeholders [Your Name], [Company], [Email], [Phone]. Some items show "no target price" — for those, ask the supplier to quote their best price. Items:\n${JSON.stringify(
+              top.map(({ r, best }) => ({
                 description: r.item.description,
                 partNumber: r.item.partNumber,
                 quantity: r.item.quantity,
-                targetPrice: r.offers[0].unitPrice,
+                targetPrice: best ? best.unitPrice : "no target price",
+                referencedSupplier: best ? best.supplier : null,
               })),
               null,
               2
@@ -297,12 +454,12 @@ function MROApp({ password }) {
           }),
         });
         const json = await res.json();
-        setRfq(json?.text || buildFallbackRFQ(top));
+        setRfq(json?.text || buildFallbackRFQ(top.map((t) => t.r)));
       } catch (err) {
-        setRfq(buildFallbackRFQ(top));
+        setRfq(buildFallbackRFQ(top.map((t) => t.r)));
       }
     } else {
-      setRfq(buildFallbackRFQ(top));
+      setRfq(buildFallbackRFQ(top.map((t) => t.r)));
     }
     setRfqLoading(false);
   };
@@ -312,12 +469,11 @@ function MROApp({ password }) {
     const deadline = new Date(today.getTime() + 14 * 24 * 60 * 60 * 1000);
     const fmtDate = (d) => d.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
     const lines = top
-      .map(
-        (r, i) =>
-          `${i + 1}. ${r.item.description} — Part: ${r.item.partNumber || "N/A"} — Qty: ${r.item.quantity} — Target unit price: ${fmt(
-            r.offers[0].unitPrice
-          )}`
-      )
+      .map((r, i) => {
+        const best = (r.offers || []).find((o) => o.found);
+        const target = best ? `Target unit price: ${fmt(best.unitPrice)}` : "Please quote your best price";
+        return `${i + 1}. ${r.item.description} — Part: ${r.item.partNumber || "N/A"} — Qty: ${r.item.quantity} — ${target}`;
+      })
       .join("\n");
     return `Subject: RFQ - MRO Items Bulk Quote Request - Response by ${fmtDate(deadline)}
 
@@ -521,9 +677,13 @@ function ItemsTab({ items, selected, setSelected, selectedCount, currentSpend, r
           <p style={S.muted}>
             {selectedCount} of {items.length} selected · current spend {fmt(currentSpend)}
           </p>
+          <p style={{ ...S.muted, marginTop: 4, fontSize: 12 }}>
+            Search uses real web lookups across Fastenal, Grainger, MSC, Motion, Zoro, Uline, and
+            Amazon Business. Allow ~10–20 seconds per item.
+          </p>
         </div>
         <button style={S.btnPrimary} disabled={selectedCount === 0} onClick={runSearch}>
-          <Search size={16} /> Run price search
+          <Search size={16} /> Run live price search
         </button>
       </div>
 
@@ -595,6 +755,40 @@ function ResultsTab({
         <KPI label="Savings rate" value={`${totals.rate.toFixed(1)}%`} color="#16a34a" />
       </div>
 
+      {/* Lookup status line */}
+      {(totals.pendingItems > 0 || totals.unmatchedItems > 0) && (
+        <div
+          style={{
+            ...S.card,
+            background: totals.pendingItems > 0 ? "#fef9c3" : "#f8fafc",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: 12,
+          }}
+        >
+          {totals.pendingItems > 0 ? (
+            <>
+              <Loader2 size={16} style={{ animation: "spin 1s linear infinite" }} />
+              <span>
+                Searching real prices… {totals.coveredItems} of{" "}
+                {totals.coveredItems + totals.pendingItems + totals.unmatchedItems} items priced
+                {totals.unmatchedItems > 0 ? ` · ${totals.unmatchedItems} no match` : ""}.
+                Numbers will update as searches complete.
+              </span>
+            </>
+          ) : (
+            <>
+              <AlertCircle size={16} color="#b45309" />
+              <span>
+                {totals.unmatchedItems} item{totals.unmatchedItems === 1 ? "" : "s"} had no clear
+                supplier match — see "investigate manually" rows below.
+              </span>
+            </>
+          )}
+        </div>
+      )}
+
       {/* AI insight */}
       <div style={S.card}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
@@ -625,7 +819,16 @@ function ResultsTab({
         <button style={S.btnGhost} onClick={() => setShowReport(!showReport)}>
           <FileText size={16} /> {showReport ? "Hide" : "Savings Report"}
         </button>
-        <button style={S.btnPrimary} onClick={generateRFQ} disabled={rfqLoading}>
+        <button
+          style={{
+            ...S.btnPrimary,
+            opacity: totals.pendingItems > 0 || rfqLoading ? 0.5 : 1,
+            cursor: totals.pendingItems > 0 || rfqLoading ? "not-allowed" : "pointer",
+          }}
+          onClick={generateRFQ}
+          disabled={rfqLoading || totals.pendingItems > 0}
+          title={totals.pendingItems > 0 ? "Wait for all price lookups to finish" : ""}
+        >
           {rfqLoading ? (
             <Loader2 size={16} style={{ animation: "spin 1s linear infinite" }} />
           ) : (
@@ -673,12 +876,69 @@ function KPI({ label, value, color }) {
   );
 }
 
+function ConfidenceBadge({ level }) {
+  const palette = {
+    high: { bg: "#dcfce7", fg: "#166534", label: "High match" },
+    medium: { bg: "#fef9c3", fg: "#854d0e", label: "Medium match" },
+    low: { bg: "#fee2e2", fg: "#991b1b", label: "Low match" },
+  };
+  const p = palette[level] || { bg: "#e2e8f0", fg: "#334155", label: level || "—" };
+  return (
+    <span
+      style={{
+        background: p.bg,
+        color: p.fg,
+        fontSize: 10,
+        fontWeight: 700,
+        padding: "2px 6px",
+        borderRadius: 4,
+        textTransform: "uppercase",
+        letterSpacing: "0.03em",
+      }}
+    >
+      {p.label}
+    </span>
+  );
+}
+
 function ResultRow({ row }) {
-  const { item, offers } = row;
-  const best = offers[0];
-  const savingsPerUnit = item.unitPrice - best.unitPrice;
+  const { item, offers, status, error } = row;
+
+  // Loading state — search still running for this item
+  if (status === "loading") {
+    return (
+      <div style={S.card}>
+        <div style={{ fontWeight: 600 }}>{item.description}</div>
+        <div style={S.muted}>
+          Part {item.partNumber || "—"} · Qty {item.quantity} · Current {fmt(item.unitPrice)}
+        </div>
+        <div style={{ ...S.muted, marginTop: 10, display: "flex", alignItems: "center", gap: 6 }}>
+          <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} />
+          Searching suppliers for real prices...
+        </div>
+      </div>
+    );
+  }
+
+  // Error state — the lookup itself failed
+  if (status === "error") {
+    return (
+      <div style={S.card}>
+        <div style={{ fontWeight: 600 }}>{item.description}</div>
+        <div style={S.muted}>
+          Part {item.partNumber || "—"} · Qty {item.quantity} · Current {fmt(item.unitPrice)}
+        </div>
+        <div style={{ color: "#dc2626", marginTop: 10, display: "flex", alignItems: "center", gap: 6 }}>
+          <AlertCircle size={14} /> Lookup failed: {error || "unknown error"}
+        </div>
+      </div>
+    );
+  }
+
+  const best = offers.find((o) => o.found);
+  const savingsPerUnit = best ? item.unitPrice - best.unitPrice : 0;
   const totalSavings = savingsPerUnit * item.quantity;
-  const savingsPct = item.unitPrice > 0 ? (savingsPerUnit / item.unitPrice) * 100 : 0;
+  const savingsPct = best && item.unitPrice > 0 ? (savingsPerUnit / item.unitPrice) * 100 : 0;
 
   return (
     <div style={S.card}>
@@ -690,41 +950,87 @@ function ResultRow({ row }) {
           </div>
         </div>
         <div style={{ textAlign: "right" }}>
-          <div style={{ color: totalSavings > 0 ? "#16a34a" : "#dc2626", fontWeight: 700 }}>
-            {totalSavings > 0 ? "Save " : ""}
-            {fmt(totalSavings)}
-          </div>
-          <div style={S.muted}>{savingsPct.toFixed(1)}% per unit</div>
+          {best ? (
+            <>
+              <div style={{ color: totalSavings > 0 ? "#16a34a" : "#dc2626", fontWeight: 700 }}>
+                {totalSavings > 0 ? "Save " : ""}
+                {fmt(totalSavings)}
+              </div>
+              <div style={S.muted}>{savingsPct.toFixed(1)}% per unit</div>
+            </>
+          ) : (
+            <div style={{ color: "#b45309", fontWeight: 600, fontSize: 13 }}>
+              No matches found — investigate manually
+            </div>
+          )}
         </div>
       </div>
 
       <div style={S.offerGrid}>
-        {offers.map((o, i) => (
-          <div
-            key={o.supplier}
-            style={{
-              ...S.offer,
-              ...(i === 0 ? S.offerBest : {}),
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div style={{ fontWeight: 600 }}>{o.supplier}</div>
-              {i === 0 && (
-                <span style={S.bestTag}>
-                  <TrendingDown size={12} /> Best
-                </span>
+        {offers.map((o, i) => {
+          const isBest = best && o.supplier === best.supplier;
+          return (
+            <div
+              key={o.supplier}
+              style={{
+                ...S.offer,
+                ...(isBest ? S.offerBest : {}),
+                opacity: o.found ? 1 : 0.7,
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 4 }}>
+                <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
+                  {o.supplier}
+                  {o.preferred && (
+                    <span title="Your preferred supplier" style={{ fontSize: 10, color: "#7c3aed" }}>
+                      ★
+                    </span>
+                  )}
+                </div>
+                {isBest && (
+                  <span style={S.bestTag}>
+                    <TrendingDown size={12} /> Best
+                  </span>
+                )}
+              </div>
+
+              {o.found ? (
+                <>
+                  <div style={{ fontSize: 22, fontWeight: 700, marginTop: 4 }}>{fmt(o.unitPrice)}</div>
+                  <div style={S.muted}>per unit · total {fmt(o.total)}</div>
+                  <div style={{ marginTop: 6 }}>
+                    <ConfidenceBadge level={o.confidence} />
+                  </div>
+                  <div style={{ ...S.muted, fontSize: 12, marginTop: 6, lineHeight: 1.35 }}>
+                    {o.matchedDescription}
+                    {o.matchedSku ? <> · SKU <span style={{ fontFamily: "monospace" }}>{o.matchedSku}</span></> : null}
+                  </div>
+                  {o.matchNotes && (
+                    <div style={{ ...S.muted, fontSize: 11, fontStyle: "italic", marginTop: 4 }}>
+                      {o.matchNotes}
+                    </div>
+                  )}
+                  {o.url && (
+                    <a href={o.url} target="_blank" rel="noreferrer" style={S.searchLink}>
+                      <ExternalLink size={12} /> View on {o.supplier}
+                    </a>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize: 13, marginTop: 8, color: "#64748b" }}>
+                    No clear match{o.reason ? `: ${o.reason}` : ""}
+                  </div>
+                  {o.fallbackUrl && (
+                    <a href={o.fallbackUrl} target="_blank" rel="noreferrer" style={S.searchLink}>
+                      <Search size={12} /> Search {o.supplier} manually
+                    </a>
+                  )}
+                </>
               )}
             </div>
-            <div style={{ fontSize: 22, fontWeight: 700, marginTop: 4 }}>{fmt(o.unitPrice)}</div>
-            <div style={S.muted}>per unit · total {fmt(o.total)}</div>
-            <div style={{ ...S.muted, fontSize: 12, marginTop: 4 }}>
-              {o.deliveryDays} day delivery · {o.rating}★
-            </div>
-            <a href={o.searchUrl} target="_blank" rel="noreferrer" style={S.searchLink}>
-              <ExternalLink size={12} /> Search on {o.supplier}
-            </a>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -766,8 +1072,8 @@ function ExportPanel({ results, totals }) {
           </thead>
           <tbody>
             {results.map((r) => {
-              const b = r.offers[0];
-              const sper = r.item.unitPrice - b.unitPrice;
+              const b = (r.offers || []).find((o) => o.found);
+              const sper = b ? r.item.unitPrice - b.unitPrice : 0;
               return (
                 <tr key={r.item.id}>
                   <td style={S.td}>{r.item.id}</td>
@@ -775,11 +1081,11 @@ function ExportPanel({ results, totals }) {
                   <td style={S.td}>{r.item.partNumber}</td>
                   <td style={S.td}>{r.item.quantity}</td>
                   <td style={S.td}>{fmt(r.item.unitPrice)}</td>
-                  <td style={S.td}>{b.supplier}</td>
-                  <td style={S.td}>{fmt(b.unitPrice)}</td>
-                  <td style={S.td}>{fmt(sper)}</td>
-                  <td style={S.td}>{fmt(sper * r.item.quantity)}</td>
-                  <td style={S.td}>{b.deliveryDays} days</td>
+                  <td style={S.td}>{b ? b.supplier : "—"}</td>
+                  <td style={S.td}>{b ? fmt(b.unitPrice) : "no match"}</td>
+                  <td style={S.td}>{b ? fmt(sper) : "—"}</td>
+                  <td style={S.td}>{b ? fmt(sper * r.item.quantity) : "—"}</td>
+                  <td style={S.td}>{b ? `${b.deliveryDays} days` : "—"}</td>
                 </tr>
               );
             })}
