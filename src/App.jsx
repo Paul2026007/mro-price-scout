@@ -140,7 +140,7 @@ function generateComparison(item) {
 }
 
 // ---------- App ----------
-export default function App() {
+function MROApp({ password }) {
   const [tab, setTab] = useState("upload");
   const [items, setItems] = useState([]);
   const [selected, setSelected] = useState({});
@@ -154,7 +154,9 @@ export default function App() {
   const [rfqLoading, setRfqLoading] = useState(false);
   const fileRef = useRef(null);
 
-  const apiKey = process.env.REACT_APP_ANTHROPIC_API_KEY;
+  // The shared password from the gate enables AI features. The actual
+  // Anthropic API key never reaches the browser — it lives in /api/ai.js.
+  const apiKey = password;
 
   const totals = useMemo(() => {
     if (!results) return null;
@@ -243,28 +245,17 @@ export default function App() {
         bestSupplier: r.offers[0].supplier,
         bestUnitPrice: r.offers[0].unitPrice,
       }));
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("/api/ai", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
-          "anthropic-dangerous-direct-browser-access": "true",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 600,
-          messages: [
-            {
-              role: "user",
-              content: `You are a procurement analyst. Write a concise (max 6 sentences) executive summary of savings opportunities from this MRO price comparison. Highlight the biggest wins and any anomalies. Data:\n${JSON.stringify(summary, null, 2)}`,
-            },
-          ],
+          password,
+          maxTokens: 600,
+          prompt: `You are a procurement analyst. Write a concise (max 6 sentences) executive summary of savings opportunities from this MRO price comparison. Highlight the biggest wins and any anomalies. Data:\n${JSON.stringify(summary, null, 2)}`,
         }),
       });
       const json = await res.json();
-      const text = json?.content?.[0]?.text || "";
-      setInsight(text);
+      setInsight(json?.text || "");
     } catch (err) {
       console.error(err);
       setInsight("");
@@ -287,36 +278,26 @@ export default function App() {
 
     if (apiKey) {
       try {
-        const res = await fetch("https://api.anthropic.com/v1/messages", {
+        const res = await fetch("/api/ai", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": apiKey,
-            "anthropic-version": "2023-06-01",
-            "anthropic-dangerous-direct-browser-access": "true",
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            model: "claude-haiku-4-5-20251001",
-            max_tokens: 1200,
-            messages: [
-              {
-                role: "user",
-                content: `Write a professional RFQ email to industrial suppliers asking for quotes on these MRO items. Include subject line, greeting, item table (description, part number, qty, target price), 2-week response deadline, and contact placeholders [Your Name], [Company], [Email], [Phone]. Items:\n${JSON.stringify(
-                  top.map((r) => ({
-                    description: r.item.description,
-                    partNumber: r.item.partNumber,
-                    quantity: r.item.quantity,
-                    targetPrice: r.offers[0].unitPrice,
-                  })),
-                  null,
-                  2
-                )}`,
-              },
-            ],
+            password,
+            maxTokens: 1200,
+            prompt: `Write a professional RFQ email to industrial suppliers asking for quotes on these MRO items. Include subject line, greeting, item table (description, part number, qty, target price), 2-week response deadline, and contact placeholders [Your Name], [Company], [Email], [Phone]. Items:\n${JSON.stringify(
+              top.map((r) => ({
+                description: r.item.description,
+                partNumber: r.item.partNumber,
+                quantity: r.item.quantity,
+                targetPrice: r.offers[0].unitPrice,
+              })),
+              null,
+              2
+            )}`,
           }),
         });
         const json = await res.json();
-        setRfq(json?.content?.[0]?.text || buildFallbackRFQ(top));
+        setRfq(json?.text || buildFallbackRFQ(top));
       } catch (err) {
         setRfq(buildFallbackRFQ(top));
       }
@@ -622,8 +603,7 @@ function ResultsTab({
         </div>
         {!apiKey && (
           <p style={S.muted}>
-            Add <code>REACT_APP_ANTHROPIC_API_KEY</code> in Vercel to enable AI-generated insights and
-            RFQs.
+            AI features unavailable — server is missing required configuration.
           </p>
         )}
         {apiKey && insightLoading && (
@@ -1024,4 +1004,124 @@ const S = {
     fontFamily: "inherit",
     resize: "vertical",
   },
+  gateBg: {
+    minHeight: "100vh",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    background: "#f8fafc",
+    padding: 16,
+  },
+  gateCard: {
+    width: "100%",
+    maxWidth: 380,
+    background: "#fff",
+    border: "1px solid #e2e8f0",
+    borderRadius: 12,
+    padding: 28,
+    boxShadow: "0 4px 20px rgba(15,23,42,0.05)",
+  },
+  gateTitle: { margin: 0, fontSize: 20, fontWeight: 700, color: "#0f172a" },
+  gateSub: { margin: "6px 0 20px", fontSize: 13, color: "#64748b" },
+  gateInput: {
+    width: "100%",
+    padding: "10px 12px",
+    border: "1px solid #cbd5e1",
+    borderRadius: 8,
+    fontSize: 15,
+    fontFamily: "inherit",
+    marginBottom: 12,
+    boxSizing: "border-box",
+  },
+  gateBtn: {
+    width: "100%",
+    padding: "10px 12px",
+    border: "none",
+    borderRadius: 8,
+    background: "#4f46e5",
+    color: "#fff",
+    fontWeight: 600,
+    fontSize: 15,
+    cursor: "pointer",
+  },
+  gateBtnDisabled: {
+    width: "100%",
+    padding: "10px 12px",
+    border: "none",
+    borderRadius: 8,
+    background: "#cbd5e1",
+    color: "#fff",
+    fontWeight: 600,
+    fontSize: 15,
+    cursor: "not-allowed",
+  },
+  gateError: { color: "#b91c1c", fontSize: 13, marginTop: 10, marginBottom: 0 },
 };
+
+// ---------- Password gate (wraps the app) ----------
+function PasswordGate() {
+  const [pw, setPw] = useState("");
+  const [authed, setAuthed] = useState(null); // null = unknown, false = bad, true = good
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!pw) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      const res = await fetch("/api/ai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: pw, action: "verify" }),
+      });
+      if (res.ok) {
+        setAuthed(true);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setAuthed(false);
+        setError(data?.error || "Incorrect password");
+      }
+    } catch (err) {
+      setError("Could not reach the server. Try again.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (authed === true) return <MROApp password={pw} />;
+
+  return (
+    <div style={S.gateBg}>
+      <form style={S.gateCard} onSubmit={submit}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+          <div style={{ ...S.logoMark, width: 32, height: 32, borderRadius: 8 }}>
+            <Sparkles size={18} color="#fff" />
+          </div>
+          <h1 style={S.gateTitle}>MRO Price Scout</h1>
+        </div>
+        <p style={S.gateSub}>Enter the access password to continue.</p>
+        <input
+          type="password"
+          autoFocus
+          value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          placeholder="Password"
+          style={S.gateInput}
+          disabled={submitting}
+        />
+        <button
+          type="submit"
+          style={submitting || !pw ? S.gateBtnDisabled : S.gateBtn}
+          disabled={submitting || !pw}
+        >
+          {submitting ? "Checking..." : "Unlock"}
+        </button>
+        {error && <p style={S.gateError}>{error}</p>}
+      </form>
+    </div>
+  );
+}
+
+export default PasswordGate;
