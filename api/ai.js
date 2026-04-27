@@ -10,7 +10,9 @@
 //                 Uses Anthropic web_search tool to find real listings.
 
 const TEXT_MODEL = "claude-haiku-4-5-20251001";
-const SEARCH_MODEL = "claude-sonnet-4-6";
+// Use Haiku for lookups too — higher rate limit, faster per-request, lets us
+// run multiple lookups in parallel without hitting Anthropic's per-minute cap.
+const SEARCH_MODEL = "claude-haiku-4-5-20251001";
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -125,12 +127,12 @@ Return one entry per supplier in the SUPPLIERS TO CHECK list.`;
   try {
     const requestBody = JSON.stringify({
       model: SEARCH_MODEL,
-      max_tokens: 2000,
+      max_tokens: 2500,
       tools: [
         {
           type: "web_search_20250305",
           name: "web_search",
-          max_uses: 6,
+          max_uses: 8,
         },
       ],
       messages: [{ role: "user", content: lookupPrompt }],
