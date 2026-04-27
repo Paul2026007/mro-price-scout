@@ -99,8 +99,11 @@ const SUPPLIERS = [
   },
 ];
 
-// How many items to look up in parallel. Web search is rate-limited so keep this modest.
-const LOOKUP_CONCURRENCY = 3;
+// How many items to look up in parallel. Anthropic enforces a 30,000 input
+// tokens/min cap on Sonnet, and each web_search call is heavy, so we run them
+// one at a time with a small breather between calls.
+const LOOKUP_CONCURRENCY = 1;
+const LOOKUP_INTER_ITEM_DELAY_MS = 4000;
 
 // ---------- Helpers ----------
 const fmt = (n) =>
@@ -252,11 +255,17 @@ function MROApp({ password }) {
     let coveredItems = 0;
     let pendingItems = 0;
     let unmatchedItems = 0;
+    let erroredItems = 0;
     for (const r of results) {
       currentSpend += r.item.unitPrice * r.item.quantity;
       if (r.status === "loading") {
         pendingItems++;
         bestSpend += r.item.unitPrice * r.item.quantity; // assume parity until done
+        continue;
+      }
+      if (r.status === "error") {
+        erroredItems++;
+        bestSpend += r.item.unitPrice * r.item.quantity; // lookup failed → keep current
         continue;
       }
       const bestFound = (r.offers || []).find((o) => o.found);
@@ -270,7 +279,16 @@ function MROApp({ password }) {
     }
     const savings = currentSpend - bestSpend;
     const rate = currentSpend > 0 ? (savings / currentSpend) * 100 : 0;
-    return { currentSpend, bestSpend, savings, rate, coveredItems, pendingItems, unmatchedItems };
+    return {
+      currentSpend,
+      bestSpend,
+      savings,
+      rate,
+      coveredItems,
+      pendingItems,
+      unmatchedItems,
+      erroredItems,
+    };
   }, [results]);
 
   const selectedCount = Object.values(selected).filter(Boolean).length;
@@ -347,6 +365,8 @@ function MROApp({ password }) {
       });
     };
 
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
     const worker = async () => {
       while (queue.length > 0) {
         const job = queue.shift();
@@ -362,6 +382,8 @@ function MROApp({ password }) {
             error: err.message || "Lookup failed",
           });
         }
+        // Breather between items so we stay under Anthropic's per-minute limit
+        if (queue.length > 0) await sleep(LOOKUP_INTER_ITEM_DELAY_MS);
       }
     };
 
@@ -384,23 +406,36 @@ function MROApp({ password }) {
     try {
       const summary = data.slice(0, 30).map((r) => {
         const best = (r.offers || []).find((o) => o.found);
+        let lookupStatus;
+        if (r.status === "error") lookupStatus = "lookup errored (rate limit or transient failure)";
+        else if (best) lookupStatus = "matched";
+        else lookupStatus = "no supplier match found";
         return {
           description: r.item.description,
           partNumber: r.item.partNumber,
           quantity: r.item.quantity,
           currentUnitPrice: r.item.unitPrice,
-          bestSupplier: best ? best.supplier : "no match found",
+          lookupStatus,
+          bestSupplier: best ? best.supplier : null,
           bestUnitPrice: best ? best.unitPrice : null,
           matchConfidence: best ? best.confidence : null,
         };
       });
+      const matchedCount = summary.filter((s) => s.lookupStatus === "matched").length;
+      const noMatchCount = summary.filter((s) => s.lookupStatus === "no supplier match found").length;
+      const erroredCount = summary.filter((s) => s.lookupStatus.startsWith("lookup errored")).length;
       const res = await fetch("/api/ai", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           password,
           maxTokens: 600,
-          prompt: `You are a procurement analyst. Write a concise (max 6 sentences) executive summary of savings opportunities from this MRO price comparison. Highlight the biggest wins and any anomalies. Data:\n${JSON.stringify(summary, null, 2)}`,
+          prompt: `You are a procurement analyst. Write a concise (max 6 sentences) executive summary of savings opportunities from this MRO price comparison.
+
+Lookup outcome: ${matchedCount} matched, ${noMatchCount} no supplier match, ${erroredCount} errored during lookup. Treat 'errored' rows as 'unknown — needs re-run', NOT as 'no match'. Only flag the items genuinely marked 'no supplier match found' as needing manual sourcing.
+
+Highlight the biggest wins and any anomalies (duplicate part numbers with different prices, extreme price gaps, etc.). Data:
+${JSON.stringify(summary, null, 2)}`,
         }),
       });
       const json = await res.json();
@@ -756,7 +791,9 @@ function ResultsTab({
       </div>
 
       {/* Lookup status line */}
-      {(totals.pendingItems > 0 || totals.unmatchedItems > 0) && (
+      {(totals.pendingItems > 0 ||
+        totals.unmatchedItems > 0 ||
+        totals.erroredItems > 0) && (
         <div
           style={{
             ...S.card,
@@ -772,17 +809,35 @@ function ResultsTab({
               <Loader2 size={16} style={{ animation: "spin 1s linear infinite" }} />
               <span>
                 Searching real prices… {totals.coveredItems} of{" "}
-                {totals.coveredItems + totals.pendingItems + totals.unmatchedItems} items priced
-                {totals.unmatchedItems > 0 ? ` · ${totals.unmatchedItems} no match` : ""}.
-                Numbers will update as searches complete.
+                {totals.coveredItems +
+                  totals.pendingItems +
+                  totals.unmatchedItems +
+                  totals.erroredItems}{" "}
+                items priced
+                {totals.unmatchedItems > 0 ? ` · ${totals.unmatchedItems} no match` : ""}
+                {totals.erroredItems > 0 ? ` · ${totals.erroredItems} errored` : ""}. Searches
+                run one at a time to stay under Anthropic's rate limit, so this takes ~15–25s
+                per item.
               </span>
             </>
           ) : (
             <>
               <AlertCircle size={16} color="#b45309" />
               <span>
-                {totals.unmatchedItems} item{totals.unmatchedItems === 1 ? "" : "s"} had no clear
-                supplier match — see "investigate manually" rows below.
+                {totals.unmatchedItems > 0 && (
+                  <>
+                    {totals.unmatchedItems} item
+                    {totals.unmatchedItems === 1 ? "" : "s"} had no clear supplier match
+                  </>
+                )}
+                {totals.unmatchedItems > 0 && totals.erroredItems > 0 ? " · " : ""}
+                {totals.erroredItems > 0 && (
+                  <>
+                    {totals.erroredItems} item{totals.erroredItems === 1 ? "" : "s"} errored
+                    during lookup (often a transient rate limit — re-run those rows)
+                  </>
+                )}
+                . See the rows flagged below.
               </span>
             </>
           )}
