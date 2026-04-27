@@ -123,26 +123,44 @@ Confidence guide:
 Return one entry per supplier in the SUPPLIERS TO CHECK list.`;
 
   try {
-    const upstream = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": anthropicKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: SEARCH_MODEL,
-        max_tokens: 4000,
-        tools: [
-          {
-            type: "web_search_20250305",
-            name: "web_search",
-            max_uses: 12,
-          },
-        ],
-        messages: [{ role: "user", content: lookupPrompt }],
-      }),
+    const requestBody = JSON.stringify({
+      model: SEARCH_MODEL,
+      max_tokens: 2000,
+      tools: [
+        {
+          type: "web_search_20250305",
+          name: "web_search",
+          max_uses: 6,
+        },
+      ],
+      messages: [{ role: "user", content: lookupPrompt }],
     });
+
+    const callAnthropic = () =>
+      fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": anthropicKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: requestBody,
+      });
+
+    // Retry with backoff on 429 (rate limit). Anthropic enforces 30k input
+    // tokens/min on Sonnet, so a brief wait usually clears the budget.
+    let upstream = await callAnthropic();
+    let attempt = 0;
+    while (upstream.status === 429 && attempt < 3) {
+      attempt += 1;
+      const retryAfterHeader = upstream.headers.get("retry-after");
+      const retryAfterSec = retryAfterHeader ? parseInt(retryAfterHeader, 10) : NaN;
+      const waitMs = Number.isFinite(retryAfterSec)
+        ? Math.min(retryAfterSec * 1000, 45000)
+        : Math.min(15000 * attempt, 45000);
+      await new Promise((r) => setTimeout(r, waitMs));
+      upstream = await callAnthropic();
+    }
 
     const data = await upstream.json();
     if (!upstream.ok) {
