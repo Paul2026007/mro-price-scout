@@ -99,11 +99,11 @@ const SUPPLIERS = [
   },
 ];
 
-// How many items to look up in parallel. Anthropic enforces a 30,000 input
-// tokens/min cap on Sonnet, and each web_search call is heavy, so we run them
-// one at a time with a small breather between calls.
-const LOOKUP_CONCURRENCY = 1;
-const LOOKUP_INTER_ITEM_DELAY_MS = 4000;
+// How many items to look up in parallel. With Haiku as the search model we get
+// a higher per-minute token budget, so 3 in parallel comfortably fits and gives
+// us ~45s for a 10-item file.
+const LOOKUP_CONCURRENCY = 3;
+const LOOKUP_INTER_ITEM_DELAY_MS = 0;
 
 // ---------- Helpers ----------
 const fmt = (n) =>
@@ -815,9 +815,8 @@ function ResultsTab({
                   totals.erroredItems}{" "}
                 items priced
                 {totals.unmatchedItems > 0 ? ` · ${totals.unmatchedItems} no match` : ""}
-                {totals.erroredItems > 0 ? ` · ${totals.erroredItems} errored` : ""}. Searches
-                run one at a time to stay under Anthropic's rate limit, so this takes ~15–25s
-                per item.
+                {totals.erroredItems > 0 ? ` · ${totals.erroredItems} errored` : ""}. Numbers
+                update as searches complete.
               </span>
             </>
           ) : (
